@@ -189,9 +189,6 @@ Error from server: admission webhook "validate.kyverno.svc-fail" denied the requ
 
 ## Screenshots
 
-### VM Configuration
-![VM Specs](screenshots/1.png)
-
 ### k3s Single-Node Cluster Running
 ![k3s Node](screenshots/4.png)
 
